@@ -1,11 +1,11 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import {
-  Plus, Trash2, Save, Play, CheckCircle2, AlertTriangle, Gauge,
-  Thermometer, Droplets, Sprout, Sun, Upload, Activity, ListChecks, Settings, Boxes, Wifi, WifiOff,
+  Plus, Trash2, Save, Play, PauseCircle, CheckCircle2, AlertTriangle, Gauge,
+  Thermometer, Droplets, Sprout, Sun, Clock, Upload, Activity, ListChecks, Settings, Boxes, Wifi, WifiOff,
   ArrowUpRight, ArrowDownRight
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -76,40 +76,105 @@ export default function RulesPage(){
   const [deviceId, setDeviceId] = useState<string>(DEFAULT_DEVICE);
   const [syncing, setSyncing] = useState(false);
   const [dark, setDark] = useState(true);
+  const [deviceList, setDeviceList] = useState<string[]>([DEFAULT_DEVICE]);
+  const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
+  const deviceIdRef = useRef(deviceId);
+
+  const muted = dark ? "text-white/70" : "text-neutral-600";
+  const subtle = dark ? "text-white/60" : "text-neutral-500";
+  const statusLabel = connected ? "Realtime aktif" : "Realtime terputus";
+
+  useEffect(() => {
+    deviceIdRef.current = deviceId;
+  }, [deviceId]);
+
+  useEffect(() => {
+    setData([]);
+    setLastSyncedAt(null);
+  }, [deviceId]);
 
   // Load/sync rules from localStorage
   useEffect(()=>{
     try{
-      const raw = localStorage.getItem("smartfarm_rules");
+      const raw = localStorage.getItem(`smartfarm_rules_${deviceId}`);
       if(raw){ setRules(JSON.parse(raw)); }
     }catch{}
-  },[]);
+  },[deviceId]);
   useEffect(()=>{
-    try{ localStorage.setItem("smartfarm_rules", JSON.stringify(rules)); }catch{}
-  },[rules]);
+    try{ localStorage.setItem(`smartfarm_rules_${deviceId}`, JSON.stringify(rules)); }catch{}
+  },[rules, deviceId]);
 
-  // Live telemetry from socket
+  // Live telemetry & rules sync via socket.io
   useEffect(()=>{
     setConnected(socket.connected);
     const onConnect = ()=> setConnected(true);
     const onDisconnect = ()=> setConnected(false);
-    const onData = (payload: SensorPayload)=>{
-      const point: TelemetryPoint = {
-        t: payload.serverTs ?? Date.now(),
-        temp: payload.temperature,
-        hum: payload.humidity,
-        soil: payload.soil_moisture,
-        lux: typeof payload.light === "number" ? Math.round(Math.min(100, payload.light > 100 ? payload.light / 2 : payload.light)) : undefined,
-      };
-      setData(prev=>[...prev, point].slice(-360));
+    const formatPoint = (payload: SensorPayload): TelemetryPoint => ({
+      t: payload.serverTs ?? Date.now(),
+      temp: payload.temperature,
+      hum: payload.humidity,
+      soil: payload.soil_moisture,
+      lux: typeof payload.light === "number"
+        ? Math.round(Math.min(100, payload.light > 100 ? payload.light / 2 : payload.light))
+        : undefined,
+    });
+    const onSnapshot = (payloads: (SensorPayload & { deviceId?: string })[] = []) => {
+      if (!payloads.length) return;
+      const ids = new Set<string>();
+      const selected = deviceIdRef.current;
+      const series: TelemetryPoint[] = [];
+      payloads.forEach((payload) => {
+        const id = payload.deviceId ?? DEFAULT_DEVICE;
+        ids.add(id);
+        if (id === selected) {
+          series.push(formatPoint(payload));
+        }
+      });
+      if (ids.size) {
+        setDeviceList((prev) => {
+          const merged = new Set([...prev, ...ids]);
+          return Array.from(merged);
+        });
+        if (!ids.has(selected)) {
+          const first = Array.from(ids)[0];
+          if (first) setDeviceId(first);
+        }
+      }
+      setData(series.slice(-360));
+    };
+    const onData = (payload: SensorPayload & { deviceId?: string })=>{
+      const id = payload.deviceId ?? DEFAULT_DEVICE;
+      setDeviceList((prev) => (prev.includes(id) ? prev : [...prev, id]));
+      if (id !== deviceIdRef.current) return;
+      setData(prev=>[...prev, formatPoint(payload)].slice(-360));
+    };
+    const onRulesSnapshot = (entries: Array<{ deviceId: string; rules: Rule[]; savedAt?: number }> = []) => {
+      if (!entries.length) return;
+      const ids = entries.map((entry) => entry.deviceId).filter(Boolean);
+      if (ids.length) {
+        setDeviceList((prev) => {
+          const merged = new Set([...prev, ...ids]);
+          return Array.from(merged);
+        });
+      }
+      const current = deviceIdRef.current;
+      const match = entries.find((entry) => entry.deviceId === current);
+      if (match) {
+        setRules(match.rules);
+        if (typeof match.savedAt === "number") setLastSyncedAt(match.savedAt);
+      }
     };
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
     socket.on("sensor:data", onData);
+    socket.on("sensor:snapshot", onSnapshot);
+    socket.on("rules:snapshot", onRulesSnapshot);
     return ()=>{
       socket.off("connect", onConnect);
       socket.off("disconnect", onDisconnect);
       socket.off("sensor:data", onData);
+      socket.off("sensor:snapshot", onSnapshot);
+      socket.off("rules:snapshot", onRulesSnapshot);
     };
   },[]);
 
@@ -152,9 +217,9 @@ export default function RulesPage(){
   const { total: totalRules, active: activeRules, inactive: inactiveRules } = ruleStats;
 
   const heroSnapshots = useMemo(() => ([
-    { label: "Rules aktif", value: activeRules, hint: `${totalRules} total` },
-    { label: "Rules standby", value: inactiveRules, hint: inactiveRules === 1 ? "1 rule nonaktif" : `${inactiveRules} rules nonaktif` },
-    { label: "Update terakhir", value: latest ? fmtTime(latest.t) : "-", hint: connected ? "Streaming langsung" : "Menunggu data" },
+    { label: "Rules aktif", value: activeRules, hint: `${totalRules} total`, icon: CheckCircle2 },
+    { label: "Rules standby", value: inactiveRules, hint: inactiveRules === 1 ? "1 rule nonaktif" : `${inactiveRules} rules nonaktif`, icon: PauseCircle },
+    { label: "Update terakhir", value: latest ? fmtTime(latest.t) : "-", hint: connected ? "Streaming langsung" : "Menunggu data", icon: Clock },
   ]), [activeRules, totalRules, inactiveRules, latest, connected]);
 
   const quickRulePreview = useMemo(() => rules.slice(0, 3), [rules]);
@@ -197,24 +262,57 @@ export default function RulesPage(){
   const removeRule = (id:string) => setRules(r=> r.filter(x=>x.id!==id));
   const updateRule = (id:string, patch: Partial<Rule>) => setRules(r=> r.map(x=> x.id===id ? {...x, ...patch} : x));
 
+  const sendControl = (payload: object) =>
+    new Promise<{ ok: boolean; error?: string }>((resolve) => {
+      socket.emit(
+        "control:send",
+        { deviceId: deviceIdRef.current, ...payload },
+        (response?: { ok?: boolean; error?: string }) => {
+          resolve({
+            ok: response?.ok ?? false,
+            error: response?.error,
+          });
+        },
+      );
+    });
+
   const syncRules = async () => {
+    if (syncing) return;
     setSyncing(true);
-    socket.emit("rules:save", { deviceId, rules });
-    toast("Rules disimpan & disync ke server");
-    setTimeout(()=>setSyncing(false), 600);
+    socket.emit(
+      "rules:save",
+      { deviceId: deviceIdRef.current, rules },
+      (response: { ok?: boolean; error?: string; savedAt?: number } | undefined) => {
+        setSyncing(false);
+        if (!response?.ok) {
+          toast(`Gagal sync rules: ${response?.error ?? "tidak diketahui"}`);
+          return;
+        }
+        if (typeof response.savedAt === "number") setLastSyncedAt(response.savedAt);
+        toast("Rules disimpan & disinkronkan");
+      },
+    );
   };
 
-  const runRuleNow = (r:Rule) => {
+  const runRuleNow = async (r:Rule) => {
     const res = evaluateRule(r);
     if(!res.ok){ toast("Kondisi belum terpenuhi"); return; }
     const pump = r.action === "pump_on";
-    socket.emit("control:send", { deviceId, cmd:"setPump", pump });
+    const result = await sendControl({ cmd:"setPump", pump });
+    if(!result.ok){
+      toast(`Gagal menjalankan aksi: ${result.error ?? "tidak diketahui"}`);
+      return;
+    }
+    toast(`Aksi dijalankan - Pompa ${pump?"ON":"OFF"}`);
     if(r.runSeconds && r.runSeconds>0){
       setTimeout(()=>{
-        socket.emit("control:send", { deviceId, cmd:"setPump", pump: !pump });
+        sendControl({ cmd:"setPump", pump: !pump }).then((ack) => {
+          if(!ack.ok){
+            toast(`Gagal mengembalikan pompa: ${ack.error ?? "tidak diketahui"}`);
+          }
+        });
       }, r.runSeconds*1000);
     }
-    toast(`Aksi dijalankan • Pompa ${pump?"ON":"OFF"}`);
   };
 
   // Theme helpers
@@ -246,7 +344,7 @@ export default function RulesPage(){
               <div className="space-y-2">
                 <p className="text-xs uppercase tracking-[0.32em] text-emerald-300/80">SmartFarm</p>
                 <h1 className="text-2xl font-semibold sm:text-3xl">Rules Orchestrator</h1>
-                <p className="max-w-2xl text-sm leading-relaxed opacity-70">
+                <p className={cn("max-w-2xl text-sm leading-relaxed", dark ? "text-white/80" : "text-neutral-700")}>
                   Rancang orkestrasi automasi yang responsif untuk mengelola irigasi dan nutrisi tanaman dengan data real-time.
                 </p>
               </div>
@@ -282,7 +380,7 @@ export default function RulesPage(){
               <h2 className="text-2xl font-semibold sm:text-3xl">
                 Kendalikan siklus penyiraman cerdas dengan logika yang kamu tentukan sendiri.
               </h2>
-              <p className="max-w-2xl text-sm leading-relaxed opacity-70">
+              <p className={cn("max-w-2xl text-sm leading-relaxed", dark ? "text-white/80" : "text-neutral-700")}>
                 Susun kondisi, kelola aksi pompa, dan pantau performa perangkat tanpa meninggalkan dashboard ini. Setiap perubahan langsung tersinkron dengan node perangkatmu.
               </p>
               <div className="flex flex-wrap items-center gap-3">
@@ -294,6 +392,11 @@ export default function RulesPage(){
                   <Upload className="h-4 w-4" />
                   {syncing ? "Syncing..." : "Sync ke Perangkat"}
                 </Button>
+                {lastSyncedAt && (
+                  <span className={cn("text-xs", muted)}>
+                    Sinkron terakhir {fmtTime(lastSyncedAt)}
+                  </span>
+                )}
                 <Link href="/">
                   <Button size="lg" variant="outline" className="gap-2">
                     <Activity className="h-4 w-4" />
@@ -301,7 +404,7 @@ export default function RulesPage(){
                   </Button>
                 </Link>
               </div>
-              <div className="flex flex-wrap items-center gap-3 text-sm opacity-75">
+              <div className={cn("flex flex-wrap items-center gap-3 text-sm", subtle)}>
                 <div className="flex items-center gap-2 rounded-full border px-3 py-1">
                   <Boxes className="h-4 w-4" />
                   <span>Device:</span>
@@ -309,12 +412,18 @@ export default function RulesPage(){
                     aria-label="Device"
                     value={deviceId}
                     onChange={(e) => setDeviceId(e.target.value)}
+                    disabled={syncing}
                     className={cn(
                       "rounded-md border px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400/40",
-                      dark ? "border-white/10 bg-white/5" : "border-neutral-200 bg-white"
+                      dark ? "border-white/10 bg-white/5" : "border-neutral-200 bg-white",
+                      syncing && "cursor-not-allowed opacity-70"
                     )}
                   >
-                    <option value="node-1">node-1</option>
+                    {deviceList.map((id) => (
+                      <option key={id} value={id}>
+                        {id}
+                      </option>
+                    ))}
                   </select>
                 </div>
                 <span className="rounded-full border px-3 py-1 text-xs uppercase tracking-wide">
@@ -326,23 +435,43 @@ export default function RulesPage(){
               "grid gap-3 rounded-2xl border p-5 text-sm backdrop-blur",
               dark ? "border-white/10 bg-white/5" : "border-white/70 bg-white/90 shadow-lg"
             )}>
-              {heroSnapshots.map((item) => (
-                <div key={item.label} className="flex items-center justify-between rounded-xl border border-white/10 px-4 py-3">
-                  <div className="flex flex-col">
-                    <span className="text-xs uppercase tracking-wide opacity-60">{item.label}</span>
-                    <span className="text-lg font-semibold">{item.value}</span>
-                  </div>
-                  <span className="text-xs opacity-60">{item.hint}</span>
-                </div>
-              ))}
+              {heroSnapshots.map((item, idx) => {
+                const Icon = item.icon;
+                return (
+                  <motion.div
+                    key={item.label}
+                    whileHover={{ y: -4 }}
+                    className={cn(
+                      "flex items-center justify-between gap-4 rounded-2xl border px-4 py-3 transition-all",
+                      dark
+                        ? "border-white/15 bg-white/10 text-white"
+                        : "border-emerald-100 bg-white text-emerald-900 shadow-sm"
+                    )}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className={cn(
+                        "flex h-10 w-10 items-center justify-center rounded-xl",
+                        dark ? "bg-emerald-500/20 text-emerald-200" : "bg-emerald-100 text-emerald-600"
+                      )}>
+                        <Icon className="h-5 w-5" />
+                      </span>
+                      <div className="flex flex-col">
+                        <span className={cn("text-xs uppercase tracking-wide", muted)}>{item.label}</span>
+                        <span className="text-xl font-semibold">{item.value}</span>
+                      </div>
+                    </div>
+                    <span className={cn("text-xs", subtle)}>{item.hint}</span>
+                  </motion.div>
+                );
+              })}
             </div>
           </div>
         </section>
 
         <section className="mt-12 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <h3 className="text-sm uppercase tracking-[0.28em] opacity-60">Snapshot Lingkungan</h3>
-            <span className="text-xs opacity-60">Update: {latest ? fmtTime(latest.t) : "-"}</span>
+            <h3 className={cn("text-sm uppercase tracking-[0.28em]", subtle)}>Snapshot Lingkungan</h3>
+            <span className={cn("text-xs", subtle)}>Update: {latest ? fmtTime(latest.t) : "-"}</span>
           </div>
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             {metricSummary.map((stat) => (
@@ -365,7 +494,7 @@ export default function RulesPage(){
               <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
                 <div>
                   <CardTitle className="text-2xl font-semibold">Daftar Rules</CardTitle>
-                  <CardDescription>Kelola semua automasi untuk pompa dan nutrisi tanaman.</CardDescription>
+                  <CardDescription className={cn(dark ? "text-white/70" : "text-neutral-600")}>Kelola semua automasi untuk pompa dan nutrisi tanaman.</CardDescription>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <div className="rounded-full border px-3 py-1 text-xs uppercase tracking-widest">
@@ -380,7 +509,7 @@ export default function RulesPage(){
             </CardHeader>
             <CardContent>
               <div className="space-y-4">
-                {rules.length === 0 && <EmptyState onAdd={addRule} />}
+                {rules.length === 0 && <EmptyState onAdd={addRule} dark={dark} />}
                 {rules.map((r, idx) => (
                   <RuleRow
                     key={r.id}
@@ -402,21 +531,27 @@ export default function RulesPage(){
               <GradientEdge />
               <CardHeader className="gap-3">
                 <CardTitle>Control Center</CardTitle>
-                <CardDescription>Monitor sensor dan jalankan aksi secara instan.</CardDescription>
+                <CardDescription className={cn(dark ? "text-white/70" : "text-neutral-600")}>Monitor sensor dan jalankan aksi secara instan.</CardDescription>
               </CardHeader>
               <CardContent className="space-y-5">
                 <div className="space-y-2">
-                  <Label className="text-xs uppercase tracking-wide opacity-70">Perangkat aktif</Label>
+                  <Label className={cn("text-xs uppercase tracking-wide", muted)}>Perangkat aktif</Label>
                   <select
                     aria-label="Device selector"
                     value={deviceId}
                     onChange={(e) => setDeviceId(e.target.value)}
+                    disabled={syncing}
                     className={cn(
                       "w-full rounded-lg border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400/40",
-                      dark ? "border-white/10 bg-white/5" : "border-neutral-200 bg-white"
+                      dark ? "border-white/10 bg-white/5" : "border-neutral-200 bg-white",
+                      syncing && "cursor-not-allowed opacity-70"
                     )}
                   >
-                    <option value="node-1">node-1</option>
+                    {deviceList.map((id) => (
+                      <option key={id} value={id}>
+                        {id}
+                      </option>
+                    ))}
                   </select>
                 </div>
 
@@ -439,6 +574,11 @@ export default function RulesPage(){
                     <Save className="h-4 w-4" />
                     {syncing ? "Menyimpan..." : "Simpan & Sync"}
                   </Button>
+                  {lastSyncedAt && (
+                    <span className={cn("text-xs", muted)}>
+                      Terakhir {fmtTime(lastSyncedAt)}
+                    </span>
+                  )}
                   <Button size="sm" variant="ghost" className="gap-2" onClick={addRule}>
                     <Plus className="h-4 w-4" />
                     Rule Cepat
@@ -451,11 +591,11 @@ export default function RulesPage(){
               <GradientEdge />
               <CardHeader className="gap-3">
                 <CardTitle>Ringkasan Automasi</CardTitle>
-                <CardDescription>Ringkas kondisi & aksi utama dari rules teratas.</CardDescription>
+                <CardDescription className={cn(dark ? "text-white/70" : "text-neutral-600")}>Ringkas kondisi & aksi utama dari rules teratas.</CardDescription>
               </CardHeader>
               <CardContent className="space-y-3">
                 {quickRulePreview.length === 0 && (
-                  <p className="text-sm opacity-70">Belum ada rule yang tersimpan. Mulai dengan menambah rule pertama.</p>
+                  <p className={cn("text-sm", subtle)}>Belum ada rule yang tersimpan. Mulai dengan menambah rule pertama.</p>
                 )}
                 {quickRulePreview.map((rule, idx) => (
                   <RulePeek
@@ -476,7 +616,7 @@ export default function RulesPage(){
           dark ? "border-white/10 bg-white/5 text-white/70" : "border-neutral-200 bg-white/90 text-neutral-600 shadow-lg"
         )}>
           <span>SmartFarm • Rules Engine</span>
-          <span>Status: {connected ? "Realtime aktif" : "Terputus"}</span>
+          <span>Status: <span className={cn("font-semibold", connected ? "text-emerald-300" : "text-amber-300")}>{statusLabel}</span></span>
         </footer>
       </div>
 
@@ -501,6 +641,8 @@ function MetricCard({ metric, latest, delta, history, dark }: {
   dark: boolean;
 }) {
   const meta = metricInfo[metric];
+  const muted = dark ? "text-white/70" : "text-neutral-600";
+  const subtle = dark ? "text-white/60" : "text-neutral-500";
   const palette = metricPalette[metric];
   const Icon = meta.icon;
   const stroke = dark ? palette.strokeDark : palette.strokeLight;
@@ -524,10 +666,10 @@ function MetricCard({ metric, latest, delta, history, dark }: {
       <div className="relative flex flex-col gap-5">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <p className="text-xs uppercase tracking-wide opacity-60">{meta.label}</p>
+            <p className={cn("text-xs uppercase tracking-wide", muted)}>{meta.label}</p>
             <div className="mt-2 flex items-baseline gap-1">
               <span className="text-3xl font-semibold">{displayValue}</span>
-              <span className="text-sm opacity-60">{meta.unit}</span>
+              <span className={cn("text-sm", subtle)}>{meta.unit}</span>
             </div>
             {showDelta ? (
               <span className={cn(
@@ -538,7 +680,7 @@ function MetricCard({ metric, latest, delta, history, dark }: {
                 {(delta ?? 0) > 0 ? "+" : ""}{Math.abs(delta ?? 0).toFixed(meta.unit === "°C" ? 1 : 0)} {meta.unit}
               </span>
             ) : (
-              <span className="mt-2 text-xs opacity-50">Stabil • 5 menit terakhir</span>
+              <span className={cn("mt-2 text-xs", subtle)}>Stabil • 5 menit terakhir</span>
             )}
           </div>
           <div className={cn("flex h-12 w-12 items-center justify-center rounded-2xl border", meta.glow)}>
@@ -560,6 +702,8 @@ function LiveTile({ metric, label, value, delta, history, dark }: {
   dark: boolean;
 }) {
   const showDelta = delta != null && Math.abs(delta) > 0.01;
+  const muted = dark ? "text-white/70" : "text-neutral-600";
+  const subtle = dark ? "text-white/60" : "text-neutral-500";
   const palette = metricPalette[metric];
   const stroke = dark ? palette.strokeDark : palette.strokeLight;
   const fill = dark ? palette.fillDark : palette.fillLight;
@@ -574,7 +718,7 @@ function LiveTile({ metric, label, value, delta, history, dark }: {
       )} />
       <div className="relative flex items-center justify-between gap-4">
         <div>
-          <p className="text-xs uppercase tracking-wide opacity-60">{label}</p>
+          <p className={cn("text-xs uppercase tracking-wide", muted)}>{label}</p>
           <p className="mt-1 text-lg font-semibold">{value}</p>
           {showDelta ? (
             <span className={cn(
@@ -585,7 +729,7 @@ function LiveTile({ metric, label, value, delta, history, dark }: {
               {(delta ?? 0) > 0 ? "+" : ""}{Math.abs(delta ?? 0).toFixed(metricInfo[metric].unit === "°C" ? 1 : 0)}
             </span>
           ) : (
-            <span className="mt-2 inline-block text-xs opacity-50">Stabil</span>
+            <span className={cn("mt-2 inline-block text-xs", subtle)}>Stabil</span>
           )}
         </div>
         <Sparkline points={history} stroke={stroke} fill={fill} />
@@ -622,14 +766,15 @@ function Sparkline({ points, stroke, fill }: { points: number[]; stroke: string;
   );
 }
 
-function EmptyState({onAdd}:{onAdd:()=>void}){
+function EmptyState({ onAdd, dark }: { onAdd: () => void; dark: boolean }) {
+  const textClass = dark ? "text-white/80" : "text-emerald-900";
   return (
     <motion.div
       initial={{ opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
-      className="rounded-3xl border border-dashed border-emerald-400/40 bg-emerald-500/10 p-6 text-center"
+      className={cn("rounded-3xl border border-dashed p-6 text-center", dark ? "border-emerald-400/50 bg-emerald-500/10" : "border-emerald-200 bg-emerald-50")}
     >
-      <p className="text-sm leading-relaxed opacity-80">Belum ada rules. Buat automation pertamamu untuk mengotomatiskan pompa.</p>
+      <p className={cn("text-sm leading-relaxed", textClass)}>Belum ada rules. Buat automation pertamamu untuk mengotomatiskan pompa.</p>
       <Button onClick={onAdd} className="mt-4 gap-2">
         <Plus className="h-4 w-4" />
         Tambah Rule
@@ -652,6 +797,8 @@ function RuleRow({ rule, index, onChange, onRemove, evaluate, onRun, dark }: {
   const Icon = meta.icon;
   const metricList: Metric[] = metricOrder;
   const comparatorList: Comparator[] = [">=", "<="];
+  const muted = dark ? "text-white/70" : "text-neutral-600";
+  const subtle = dark ? "text-white/60" : "text-neutral-500";
   return (
     <motion.div
       initial={{ opacity: 0, y: 6 }}
@@ -688,7 +835,7 @@ function RuleRow({ rule, index, onChange, onRemove, evaluate, onRun, dark }: {
             </span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-xs opacity-60">#{index + 1}</span>
+            <span className={cn("text-xs", subtle)}>#{index + 1}</span>
             <Switch checked={rule.enabled} onCheckedChange={(v) => onChange({ enabled: v })} />
             <Button variant="destructive" size="icon" onClick={onRemove}>
               <Trash2 className="h-4 w-4" />
@@ -698,7 +845,7 @@ function RuleRow({ rule, index, onChange, onRemove, evaluate, onRun, dark }: {
 
         <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
           <div className="flex flex-col gap-1">
-            <Label className="text-xs uppercase tracking-wide opacity-70">Metric</Label>
+            <Label className={cn("text-xs uppercase tracking-wide", muted)}>Metric</Label>
             <select
               className={cn(
                 "w-full rounded-lg border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400/40",
@@ -713,7 +860,7 @@ function RuleRow({ rule, index, onChange, onRemove, evaluate, onRun, dark }: {
             </select>
           </div>
           <div className="flex flex-col gap-1">
-            <Label className="text-xs uppercase tracking-wide opacity-70">Kondisi</Label>
+            <Label className={cn("text-xs uppercase tracking-wide", muted)}>Kondisi</Label>
             <select
               className={cn(
                 "w-full rounded-lg border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400/40",
@@ -728,7 +875,7 @@ function RuleRow({ rule, index, onChange, onRemove, evaluate, onRun, dark }: {
             </select>
           </div>
           <div className="flex flex-col gap-1">
-            <Label className="text-xs uppercase tracking-wide opacity-70">Nilai {metricInfo[rule.metric].unit}</Label>
+            <Label className={cn("text-xs uppercase tracking-wide", muted)}>Nilai {metricInfo[rule.metric].unit}</Label>
             <Input
               type="number"
               value={String(rule.value)}
@@ -740,7 +887,7 @@ function RuleRow({ rule, index, onChange, onRemove, evaluate, onRun, dark }: {
             />
           </div>
           <div className="flex flex-col gap-1">
-            <Label className="text-xs uppercase tracking-wide opacity-70">Stabil (detik)</Label>
+            <Label className={cn("text-xs uppercase tracking-wide", muted)}>Stabil (detik)</Label>
             <Input
               type="number"
               value={String(rule.forSeconds ?? 0)}
@@ -752,7 +899,7 @@ function RuleRow({ rule, index, onChange, onRemove, evaluate, onRun, dark }: {
             />
           </div>
           <div className="flex flex-col gap-1">
-            <Label className="text-xs uppercase tracking-wide opacity-70">Aksi</Label>
+            <Label className={cn("text-xs uppercase tracking-wide", muted)}>Aksi</Label>
             <select
               className={cn(
                 "w-full rounded-lg border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400/40",
@@ -766,7 +913,7 @@ function RuleRow({ rule, index, onChange, onRemove, evaluate, onRun, dark }: {
             </select>
           </div>
           <div className="flex flex-col gap-1">
-            <Label className="text-xs uppercase tracking-wide opacity-70">Durasi aksi (detik)</Label>
+            <Label className={cn("text-xs uppercase tracking-wide", muted)}>Durasi aksi (detik)</Label>
             <Input
               type="number"
               value={String(rule.runSeconds ?? 0)}
@@ -791,7 +938,7 @@ function RuleRow({ rule, index, onChange, onRemove, evaluate, onRun, dark }: {
               {res.ok ? <CheckCircle2 className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
               {res.ok ? "Siap" : "Belum siap"}
             </span>
-            <span className="text-xs opacity-70">• {res.reason}</span>
+            <span className={cn("text-xs", muted)}>• {res.reason}</span>
           </div>
           <Button size="sm" variant="secondary" className="gap-2" onClick={onRun}>
             <Play className="h-4 w-4" />
@@ -810,6 +957,8 @@ function RulePeek({ rule, index, evaluate, dark }: {
   dark: boolean;
 }) {
   const meta = metricInfo[rule.metric];
+  const muted = dark ? "text-white/70" : "text-neutral-600";
+  const subtle = dark ? "text-white/60" : "text-neutral-500";
   const Icon = meta.icon;
   const evalResult = evaluate();
   const actionLabel = rule.action === "pump_on" ? "Pompa ON" : "Pompa OFF";
@@ -826,13 +975,13 @@ function RulePeek({ rule, index, evaluate, dark }: {
         </div>
         <div className="space-y-1">
           <div className="flex items-center gap-2">
-            <span className="text-xs uppercase tracking-wide opacity-60">#{index + 1}</span>
+            <span className={cn("text-xs uppercase tracking-wide", subtle)}>#{index + 1}</span>
             <span className="font-medium leading-tight">{rule.name || `Rule ${index + 1}`}</span>
           </div>
-          <p className="text-xs opacity-70">
+          <p className={cn("text-xs", muted)}>
             {conditionLabel} • {durationLabel} • {actionLabel}
           </p>
-          <p className="text-xs opacity-60">{evalResult.reason}</p>
+          <p className={cn("text-xs", subtle)}>{evalResult.reason}</p>
         </div>
       </div>
       <span className={cn(
@@ -866,11 +1015,17 @@ function NavItem({ href, icon, label, active=false }: { href?: string; icon: Rea
 }
 
 function StatusPill({ connected }: { connected: boolean }) {
+  const badge = connected
+    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+    : "border-amber-400/40 bg-amber-500/10 text-amber-100";
+  const dot = connected ? "bg-emerald-400" : "bg-amber-400";
+  const label = connected ? "Realtime tersambung" : "Realtime terputus";
+
   return (
-    <div className={cn("flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs border", connected?"border-emerald-500/40 text-emerald-300 bg-emerald-500/10":"border-rose-500/40 text-rose-300 bg-rose-500/10") }>
-      <span className={cn("h-2 w-2 rounded-full animate-pulse", connected?"bg-emerald-400":"bg-rose-400")} />
-      {connected ? <Wifi className="h-3.5 w-3.5"/> : <WifiOff className="h-3.5 w-3.5"/>}
-      {connected ? "WS Connected" : "Disconnected"}
+    <div className={cn("flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs", badge)}>
+      <span className={cn("h-2 w-2 rounded-full", dot)} />
+      {connected ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}
+      {label}
     </div>
   );
 }
@@ -920,3 +1075,4 @@ function ToastHost(){
     </div>
   );
 }
+
